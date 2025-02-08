@@ -1,9 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{ops::Deref, sync::Arc, time::Duration};
 
 use polars::{df, frame::DataFrame};
 use thirtyfour::prelude::*;
 use clap::Parser;
-use tokio::time::sleep;
+use tokio::{sync::{Mutex, Semaphore}, task, time::sleep};
 use polars_io::prelude::*;
 use std::fs::File;
 use regex::Regex;
@@ -22,7 +22,13 @@ struct Args {
     start_date: Option<String>,
 
     #[arg(long, short)]
-    end_date: Option<String>,
+    finish_date: Option<String>,
+
+    #[arg(long, short)]
+    north: f64,
+
+    #[arg(long, short)]
+    east: f64,
 }
 
 #[tokio::main]
@@ -35,23 +41,25 @@ async fn main() -> WebDriverResult<()> {
     let place1 = Arc::clone(&place);
     let count = args.count;
 
-    let dates = match (args.start_date, args.end_date) {
+    let dates = match (args.start_date, args.finish_date) {
         (Some(start), Some(end)) => Some((start, end)),
         (Some(_), None) => None,
         (None, Some(_)) => None,
         _ => None,
     };
+    
+    let coords = (args.north, args.east);
 
     let airbnb_dates = dates.clone();
     let airbnb = tokio::spawn(async move{
-        airbnb_scrape(place1, driver, count, airbnb_dates).await.expect("Failed to scrape Airbnb");
+        airbnb_scrape(place1, driver, count, airbnb_dates, coords).await.expect("Failed to scrape Airbnb");
     });
 
     airbnb.await.expect("Failed Airbnb");
     Ok(())
 }
 
-async fn airbnb_scrape(place_arc: Arc<String>, driver: WebDriver, mut count: u8, dates: Option<(String, String)>) -> WebDriverResult<()>{
+async fn airbnb_scrape(place_arc: Arc<String>, driver: WebDriver, mut count: u8, dates: Option<(String, String)>, coords: (f64, f64)) -> WebDriverResult<()>{
     let place = place_arc.to_string();
     driver.maximize_window().await?;
     driver.goto("https://www.airbnb.ie/?locale=en&_set_bev_on_new_domain=1738317976_EAODY3MmFhMGFkYz").await?;
@@ -82,10 +90,9 @@ async fn airbnb_scrape(place_arc: Arc<String>, driver: WebDriver, mut count: u8,
     let submit = driver.find(By::Css("#search-tabpanel > div > div.c111bvlt.atm_9s_1txwivl.atm_1eltean_1osqo2v.c1gh7ier.atm_am_1qhqiko.dir.dir-ltr > div.c1ddhymz.atm_h_1h6ojuz.atm_9s_1txwivl.atm_gi_1n1ank9.atm_jb_idpfg4.atm_mk_h2mmj6.atm_vy_10bmcub.cggll98.atm_am_1qhqiko.dir.dir-ltr > div.snd2ne0.atm_am_12336oc.atm_gz_yjp0fh.atm_ll_rdoju8.atm_mk_h2mmj6.atm_wq_qfx8er.dir.dir-ltr > button"))
                                         .await.expect("Could not find submit button");
     submit.click().await.expect("Could not click button");
-    sleep(Duration::from_secs(2)).await;  
+    sleep(Duration::from_secs(1)).await;  
 
-    let mut df: DataFrame = extract_specific_children(&driver).await.unwrap();
-    let mut distances: Vec<i32> = Vec::with_capacity(df["Link"].len());
+    let mut df: DataFrame = extract_info(&driver, coords).await.unwrap();
 
     let mut file = File::create("results.csv").expect("could not create file");
     CsvWriter::new(&mut file)
@@ -144,7 +151,7 @@ async fn click_button(driver: &WebDriver, id: String) {
     };
 }
 
-async fn extract_specific_children(driver: &WebDriver) -> WebDriverResult<DataFrame> {
+async fn extract_info(driver: &WebDriver, coords: (f64, f64)) -> WebDriverResult<DataFrame> {
     let mut prices: Vec<i32> = Vec::new();
     let mut ratings:Vec<f32> = Vec::new();
     let mut rating_counts: Vec<i32> = Vec::new();
@@ -192,7 +199,7 @@ async fn extract_specific_children(driver: &WebDriver) -> WebDriverResult<DataFr
 
             if let Ok(link) = element.find(By::Css("a")).await {
                 if let Ok(Some(url)) = link.attr("href").await {
-                    links.push(url);
+                    links.push(format!("https://www.airbnb.ie{}", url));
                 }
             }
         }
@@ -202,11 +209,43 @@ async fn extract_specific_children(driver: &WebDriver) -> WebDriverResult<DataFr
         };
 
     }
+    let num_links = links.len();
+    let distances = Arc::new(Mutex::new(vec![-1; num_links]));
+    let bathrooms = Arc::new(Mutex::new(vec![String::new(); num_links]));
+    let og_tab = driver.window().await.unwrap();
+    let semaphore = Arc::new(Semaphore::new(25));
+
+    let driver = Arc::new(Mutex::new(driver.clone()));
+    let mut handles = Vec::with_capacity(num_links);
+
+    for (i, link) in links.clone().into_iter().enumerate() {
+        let distances = Arc::clone(&distances);
+        let bathrooms = Arc::clone(&bathrooms);
+        let driver = Arc::clone(&driver);
+        let semaphore = Arc::clone(&semaphore);
+        let og_tab = og_tab.clone();
+
+        let handle = task::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            process_link(i, link, distances, bathrooms, driver, coords, og_tab).await;
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let distances = distances.lock().await.deref().to_owned();
+    let bathrooms = bathrooms.lock().await.deref().to_owned();
     let df = df![
         "Price" => prices,
         "Rating" => ratings,
         "Rating Counts" => rating_counts,
-        "Link" => links
+        "Link" => links,
+        "Distance" => distances,
+        "Bath info" => bathrooms,
     ].unwrap();
 
     Ok(df)
@@ -224,7 +263,6 @@ fn extract_rating_info(text: &str) -> Option<(f32, i32)> {
     None
 }
 
-
 fn extract_price(text: &str) -> Option<i32> {
     let re = Regex::new(r"([\d.]+)").unwrap();
 
@@ -234,4 +272,83 @@ fn extract_price(text: &str) -> Option<i32> {
     }
     
     None
+}
+
+async fn process_link(
+    index: usize,
+    link: String,
+    distances: Arc<Mutex<Vec<i32>>>,
+    bathrooms: Arc<Mutex<Vec<String>>>,
+    driver: Arc<Mutex<WebDriver>>,
+    coords: (f64, f64),
+    og_tab: WindowHandle
+) {
+    // Step 1: Lock only when creating a new tab
+    let tab = {
+        let driver = driver.lock().await;
+        let tab = driver.new_tab().await.unwrap();
+        driver.switch_to_window(tab.clone()).await.unwrap();
+        driver.goto(&link).await.unwrap();
+        driver.switch_to_window(og_tab.clone()).await.unwrap();
+        tab
+    };
+
+    sleep(Duration::from_secs(1)).await; // Let JavaScript finish loading
+
+    // Step 3: Process and store results
+    let mut distance = 0;
+    let mut bath = String::new();
+    
+    {
+        let driver = driver.lock().await;
+        driver.switch_to_window(tab.clone()).await.unwrap();
+        click_button(&driver, "body > div:nth-child(14) > div > div > section > div > div > div.p1psejvv.atm_9s_1bgihbq.dir.dir-ltr > div > div.c1lbtiq8.atm_mk_stnw88.atm_9s_1txwivl.atm_fq_1tcgj5g.atm_wq_kb7nvz.atm_tk_1tcgj5g.dir.dir-ltr > button".to_owned()).await;
+    
+        if let Ok(element) = driver.find(By::Css("#site-content > div > div:nth-child(1) > div:nth-child(5) > div > div > div > div:nth-child(2) > section > div.moroaa0.atm_5j_1fwxnve.atm_ks_15vqwwr.atm_mk_h2mmj6.atm_e2_g7qh6l.atm_5j_gktfv__oggzyc.atm_e2_78o8zw__oggzyc.atm_gq_n9wab5__oggzyc.dir.dir-ltr > div:nth-child(6) > div:nth-child(3) > div > div.gm-style > div:nth-child(14) > div > a")).await {
+            if let Ok(Some(href)) = element.attr("href").await {
+                let re = Regex::new(r"ll=(-?\d+\.\d+),(-?\d+\.\d+)").unwrap();
+                if let Some(caps) = re.captures(&href) {
+                    let lat = caps[1].parse::<f64>().unwrap();
+                    let lon = caps[2].parse::<f64>().unwrap();
+                    distance = haversine_distance(lat, lon, coords.0, coords.1);
+                }
+            }
+        }
+        let elements = driver.find_all(By::XPath("//*[contains(text(), 'bathroom')]")).await.unwrap();
+        for element in elements {
+            if let Ok(text) = element.text().await {
+                bath.push_str(&text);
+                bath.push('\n');
+            }
+        }
+        driver.switch_to_window(og_tab.clone()).await.unwrap();
+    }
+
+    {
+        let mut distances_lock = distances.lock().await;
+        let mut bathrooms_lock = bathrooms.lock().await;
+        bathrooms_lock[index] = bath;
+        distances_lock[index] = distance;
+    }
+
+    {
+        let driver = driver.lock().await;
+        driver.switch_to_window(tab).await.unwrap();
+        driver.close_window().await.unwrap();
+        driver.switch_to_window(og_tab).await.unwrap();
+    } // Lock released
+
+}
+
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> i32 {
+    const R: f64 = 6_371_000.0;
+    let lat1_rad = lat1.to_radians();
+    let lon1_rad = lon1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let lon2_rad = lon2.to_radians();
+    let dlat = lat2_rad - lat1_rad;
+    let dlon = lon2_rad - lon1_rad;
+    let a = (dlat / 2.0).sin().powi(2) + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    (R * c).round() as i32
 }
