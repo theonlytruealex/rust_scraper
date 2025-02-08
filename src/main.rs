@@ -224,7 +224,7 @@ async fn extract_info(driver: &WebDriver, coords: (f64, f64)) -> WebDriverResult
         let driver = Arc::clone(&driver);
         let semaphore = Arc::clone(&semaphore);
         let og_tab = og_tab.clone();
-
+        sleep(Duration::from_secs(1)).await;
         let handle = task::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
             process_link(i, link, distances, bathrooms, driver, coords, og_tab).await;
